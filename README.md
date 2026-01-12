@@ -3,6 +3,8 @@
 Recorder Button is a Krita Python plugin that adds an optional toolbar button/indicator for users who record timelapses but don't want the layers docker always taking space. <br>
 It shows whether or not you're recording with the Recording docker. You can left-click to start/stop recording, right-click to open the Recording docker. <br>
 
+<img src="https://github.com/user-attachments/assets/d3ca5c6c-a867-47b8-adea-17d042828b75" height="400" />
+
 ![Button in action](https://github.com/user-attachments/assets/d3ca5c6c-a867-47b8-adea-17d042828b75)
 
 
