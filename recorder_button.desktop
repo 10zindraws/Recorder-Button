@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Service
+ServiceTypes=Krita/PythonPlugin
+X-KDE-Library=recorder_button
+X-Python-2-Compatible=false
+X-Krita-Manual=Manual.html
+Name=Recorder Button
+Comment=Toolbar button to toggle canvas recording and display recording state
