@@ -17,7 +17,119 @@ from krita import Extension, Krita
 
 from PyQt5.QtCore import QTimer, QSize, QObject, QEvent, Qt, QPoint
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QCursor
-from PyQt5.QtWidgets import QAction, QApplication, QToolButton, QDockWidget
+from PyQt5.QtWidgets import QAction, QApplication, QToolButton, QDockWidget, QSizePolicy
+
+
+class DockerAutoCloseFilter(QObject):
+    """
+    Global event filter that closes the recorder docker when the user clicks
+    outside of it or taps the canvas with a drawing tablet pen.
+    
+    This filter is installed only when the docker is opened via right-click
+    on the Recorder Button, providing popup-like auto-dismiss behavior.
+    """
+    
+    def __init__(self, docker, extension, parent=None):
+        super().__init__(parent)
+        self._docker = docker
+        self._extension = extension
+        self._active = True
+    
+    def deactivate(self):
+        """Deactivate this filter so it stops processing events."""
+        self._active = False
+    
+    def _is_click_inside_docker(self, widget):
+        """
+        Check if a widget is the docker or a child/descendant of the docker.
+        
+        Args:
+            widget: The widget that received the click event
+            
+        Returns:
+            True if the widget is inside the docker, False otherwise
+        """
+        if widget is None or self._docker is None:
+            return False
+        
+        # Walk up the widget hierarchy to see if we hit the docker
+        current = widget
+        while current is not None:
+            if current is self._docker:
+                return True
+            # Also check by object identity in case of proxy objects
+            if isinstance(current, QDockWidget):
+                obj_name = current.objectName()
+                if obj_name and "Recorder" in obj_name:
+                    return True
+            current = current.parent()
+        
+        return False
+    
+    def _close_docker(self):
+        """Close the docker and uninstall this event filter."""
+        if not self._active:
+            return
+        
+        self._active = False
+        
+        # Uninstall ourselves from the application
+        app = QApplication.instance()
+        if app:
+            app.removeEventFilter(self)
+        
+        # Hide the docker
+        if self._docker and self._docker.isVisible():
+            toggle_action = self._docker.toggleViewAction()
+            if toggle_action and toggle_action.isChecked():
+                toggle_action.trigger()
+            else:
+                self._docker.hide()
+        
+        # Notify extension that auto-close filter is no longer active
+        if self._extension:
+            self._extension._on_auto_close_filter_removed()
+    
+    def eventFilter(self, obj, event):
+        """Filter events to detect clicks outside the docker."""
+        if not self._active or self._docker is None:
+            return False
+        
+        # Check if docker was closed by other means
+        if not self._docker.isVisible():
+            self._active = False
+            app = QApplication.instance()
+            if app:
+                app.removeEventFilter(self)
+            if self._extension:
+                self._extension._on_auto_close_filter_removed()
+            return False
+        
+        event_type = event.type()
+        
+        # Handle mouse button press (left-click)
+        if event_type == QEvent.MouseButtonPress:
+            if event.button() == Qt.LeftButton:
+                # Get the widget under the cursor
+                target_widget = QApplication.widgetAt(QCursor.pos())
+                
+                if not self._is_click_inside_docker(target_widget):
+                    # Click is outside the docker - close it
+                    # Use a timer to allow the click event to propagate first
+                    QTimer.singleShot(0, self._close_docker)
+                    return False  # Don't consume the event
+        
+        # Handle tablet press (drawing tablet pen tap)
+        elif event_type == QEvent.TabletPress:
+            # Get the widget under the cursor
+            target_widget = QApplication.widgetAt(QCursor.pos())
+            
+            if not self._is_click_inside_docker(target_widget):
+                # Tablet tap is outside the docker - close it
+                QTimer.singleShot(0, self._close_docker)
+                return False  # Don't consume the event
+        
+        return False  # Never consume events, just observe them
 
 
 class ToolButtonEventFilter(QObject):
@@ -62,6 +174,7 @@ class RecorderButtonExtension(Extension):
         self._hook_timer = None
         self._event_filters = []  # Keep references to prevent garbage collection
         self._toolbar_buttons_installed = set()  # Track which buttons have filters
+        self._auto_close_filter = None  # Global event filter for auto-closing docker
 
     def setup(self):
         """Called once when Krita starts, before any windows exist."""
@@ -290,6 +403,31 @@ class RecorderButtonExtension(Extension):
                 action.setIcon(RecorderButtonExtension._icon_not_recording)
             action.setToolTip("Click to start recording\nRight-click: Open/hide docker")
 
+    def _on_auto_close_filter_removed(self):
+        """Called when the auto-close filter is removed or deactivated."""
+        self._auto_close_filter = None
+    
+    def _install_auto_close_filter(self, docker):
+        """
+        Install a global event filter to auto-close the docker when clicking outside.
+        
+        Args:
+            docker: The recorder docker to monitor
+        """
+        # Remove any existing auto-close filter
+        if self._auto_close_filter is not None:
+            self._auto_close_filter.deactivate()
+            app = QApplication.instance()
+            if app:
+                app.removeEventFilter(self._auto_close_filter)
+            self._auto_close_filter = None
+        
+        # Create and install new filter
+        self._auto_close_filter = DockerAutoCloseFilter(docker, self)
+        app = QApplication.instance()
+        if app:
+            app.installEventFilter(self._auto_close_filter)
+    
     def _install_event_filter_for_action(self, action):
         """
         Find the toolbar button for the given action and install an event filter
@@ -362,6 +500,10 @@ class RecorderButtonExtension(Extension):
         else:
             # Docker is hidden - show it at cursor position
             self._show_docker_at_cursor(docker)
+            
+            # Install auto-close filter for popup-like behavior
+            # This makes the docker close when clicking outside of it
+            self._install_auto_close_filter(docker)
 
     def _restore_docker_size_constraints(self, docker):
         """
@@ -390,6 +532,105 @@ class RecorderButtonExtension(Extension):
             docker.setMinimumHeight(100)
             docker.setMaximumHeight(MAX_QT_DIMENSION)
 
+    def _restore_docker_title_bar(self, docker):
+        """
+        Restore the title bar for a floating docker.
+        When super_docker_lock is enabled on startup, it may collapse title bars
+        for grouped dockers. This restores them for floating dockers.
+        
+        Args:
+            docker: The QDockWidget to restore title bar for
+        """
+        title_bar = docker.titleBarWidget()
+        if not title_bar:
+            return
+        
+        # Check if title bar was collapsed by super_docker_lock
+        collapsed = title_bar.property("_super_docker_lock_titlebar_collapsed")
+        if not collapsed:
+            return
+        
+        # Restore stored state from super_docker_lock properties
+        stored_min = title_bar.property("_super_docker_lock_titlebar_min_height")
+        stored_max = title_bar.property("_super_docker_lock_titlebar_max_height")
+        stored_style = title_bar.property("_super_docker_lock_titlebar_style")
+        stored_style_attr = title_bar.property("_super_docker_lock_titlebar_style_attr")
+        stored_policy = title_bar.property("_super_docker_lock_titlebar_size_policy")
+        stored_margins = title_bar.property("_super_docker_lock_titlebar_margins")
+        stored_layout_margins = title_bar.property("_super_docker_lock_titlebar_layout_margins")
+        stored_layout_spacing = title_bar.property("_super_docker_lock_titlebar_layout_spacing")
+        
+        # Restore stylesheet
+        if stored_style is None:
+            stored_style = ""
+        if stored_style_attr is None:
+            stored_style_attr = False
+        title_bar.setStyleSheet(stored_style)
+        if not stored_style_attr and not stored_style:
+            title_bar.setAttribute(Qt.WA_StyleSheet, False)
+        
+        # Restore height constraints
+        if stored_min is None:
+            stored_min = 0
+        if stored_max is None:
+            stored_max = 16777215
+        title_bar.setMinimumHeight(int(stored_min))
+        title_bar.setMaximumHeight(int(stored_max))
+        
+        # Restore size policy
+        if stored_policy and isinstance(stored_policy, (tuple, list)) and len(stored_policy) >= 2:
+            policy = QSizePolicy(int(stored_policy[0]), int(stored_policy[1]))
+            if len(stored_policy) >= 3:
+                policy.setControlType(QSizePolicy.ControlType(int(stored_policy[2])))
+            title_bar.setSizePolicy(policy)
+        
+        # Restore margins
+        if stored_margins and isinstance(stored_margins, (tuple, list)) and len(stored_margins) >= 4:
+            title_bar.setContentsMargins(
+                int(stored_margins[0]),
+                int(stored_margins[1]),
+                int(stored_margins[2]),
+                int(stored_margins[3]),
+            )
+        
+        # Restore layout margins and spacing
+        layout = title_bar.layout()
+        if layout:
+            if (
+                stored_layout_margins
+                and isinstance(stored_layout_margins, (tuple, list))
+                and len(stored_layout_margins) >= 4
+            ):
+                layout.setContentsMargins(
+                    int(stored_layout_margins[0]),
+                    int(stored_layout_margins[1]),
+                    int(stored_layout_margins[2]),
+                    int(stored_layout_margins[3]),
+                )
+            if stored_layout_spacing is not None:
+                layout.setSpacing(int(stored_layout_spacing))
+        
+        # Mark title bar as no longer collapsed
+        title_bar.setProperty("_super_docker_lock_titlebar_collapsed", None)
+        title_bar.setVisible(True)
+        
+        # Refresh layout
+        if layout:
+            layout.invalidate()
+        title_bar.updateGeometry()
+        title_bar.update()
+        docker.updateGeometry()
+        
+        # Clear stored properties
+        title_bar.setProperty("_super_docker_lock_titlebar_min_height", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_max_height", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_style", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_style_attr", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_size_policy", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_margins", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_layout_margins", None)
+        title_bar.setProperty("_super_docker_lock_titlebar_layout_spacing", None)
+
     def _show_docker_at_cursor(self, docker):
         """
         Show a docker as a floating window at the current cursor position,
@@ -411,8 +652,16 @@ class RecorderButtonExtension(Extension):
         # Restore size constraints that may have been locked by super_docker_lock
         self._restore_docker_size_constraints(docker)
         
+        # Restore title bar if it was collapsed by super_docker_lock
+        # This is needed when super_docker_lock is enabled on Krita startup
+        self._restore_docker_title_bar(docker)
+        
         # Get cursor position
         cursor_pos = QCursor.pos()
+        
+        # Process pending events to ensure state changes take effect
+        # This is important when super_docker_lock is active from startup
+        QApplication.processEvents()
         
         # Use toggleViewAction for proper visibility handling
         # This is the Qt-native way to show/hide dock widgets and works
@@ -423,6 +672,13 @@ class RecorderButtonExtension(Extension):
         else:
             # Fallback if toggleViewAction not available or already checked
             docker.show()
+        
+        # Process events again and ensure visibility
+        QApplication.processEvents()
+        
+        # Force visibility if still not visible
+        if not docker.isVisible():
+            docker.setVisible(True)
         
         # Ensure the docker is visible and on top
         docker.raise_()
